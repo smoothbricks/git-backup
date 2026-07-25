@@ -1,5 +1,5 @@
 import { $ } from "bun";
-import { mkdir, unlink } from "node:fs/promises";
+import { access, constants, mkdir, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { DEFAULT_LABEL } from "./config.ts";
 
@@ -76,6 +76,52 @@ export function agentPath(): string {
   return git ? `${dirname(git)}:${base}` : base;
 }
 
+export type Ownership =
+  | { kind: "absent" }
+  | { kind: "ours" }
+  | { kind: "managed"; program: string | null; byNix: boolean };
+
+/**
+ * Who owns the plist for this label?
+ *
+ * Writability is the signal, not the file type. home-manager installs a
+ * read-only REGULAR file (-r--r--r--), nix-darwin and some other tools use a
+ * store symlink, and a hand-rolled agent is a plain writable file - so probing
+ * the write permission covers all three where an lstat check would not.
+ */
+export async function agentOwnership(label: string): Promise<Ownership> {
+  const { plist } = agentPaths(label);
+  try {
+    await access(plist, constants.F_OK);
+  } catch {
+    return { kind: "absent" };
+  }
+
+  try {
+    await access(plist, constants.W_OK);
+    return { kind: "ours" };
+  } catch {
+    const program = await plistProgram(plist);
+    return { kind: "managed", program, byNix: program?.startsWith("/nix/store/") ?? false };
+  }
+}
+
+/** First entry of ProgramArguments, via plutil so we do not parse XML by hand. */
+async function plistProgram(plist: string): Promise<string | null> {
+  const res = await $`plutil -convert json -o - ${plist}`.quiet().nothrow();
+  if (res.exitCode !== 0) return null;
+  try {
+    const parsed: unknown = JSON.parse(res.stdout.toString());
+    if (parsed !== null && typeof parsed === "object" && "ProgramArguments" in parsed) {
+      const args = parsed.ProgramArguments;
+      if (Array.isArray(args) && typeof args[0] === "string") return args[0];
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 export async function installAgent(opts: {
   label: string;
   interval: number;
@@ -86,15 +132,21 @@ export async function installAgent(opts: {
 
   await mkdir(dirname(paths.plist), { recursive: true });
   await mkdir(dirname(paths.log), { recursive: true });
-  await Bun.write(
-    paths.plist,
-    plistFor(opts.label, exe, {
-      interval: opts.interval,
-      log: paths.log,
-      startOnMount: opts.startOnMount,
-      path: agentPath(),
-    }),
-  );
+
+  try {
+    await Bun.write(
+      paths.plist,
+      plistFor(opts.label, exe, {
+        interval: opts.interval,
+        log: paths.log,
+        startOnMount: opts.startOnMount,
+        path: agentPath(),
+      }),
+    );
+  } catch (e) {
+    const why = e instanceof Error ? e.message : String(e);
+    throw new Error(`could not write ${paths.plist}\n  ${why}`);
+  }
 
   const target = `gui/${process.getuid?.() ?? 501}`;
   // bootout first: bootstrap refuses when a service with this label already exists.

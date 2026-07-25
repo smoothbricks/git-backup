@@ -12,7 +12,7 @@ import { status } from "./status.ts";
 import { atticSweep, gcAttic, lsRemote, pushAll, reachable } from "./remote.ts";
 import { initRepo, registerPath, registeredRepos, summarize, unregisterPath } from "./registry.ts";
 import { installHooks, uninstallHooks } from "./hooks.ts";
-import { agentPaths, agentStatus, installAgent, kickAgent, uninstallAgent } from "./agent.ts";
+import { agentOwnership, agentPaths, agentStatus, installAgent, kickAgent, uninstallAgent } from "./agent.ts";
 import { manualSetupHint, setNoInteractive, setupWizard } from "./interactive.ts";
 
 const OK = 0;
@@ -257,8 +257,27 @@ async function cmdAgent(sub: string, o: Opts): Promise<number> {
   const git = repo?.git ?? new Git(process.cwd());
   let cfg = await loadConfig(git);
 
+  const owned = await agentOwnership(cfg.agentLabel);
+
   switch (sub) {
     case "install": {
+      // Already installed declaratively: writing the plist would fail with a
+      // bare EACCES, and overwriting it would be wrong anyway - the next
+      // activation would revert it. Report the real state and stop.
+      if (owned.kind === "managed") {
+        const s = await agentStatus(cfg.agentLabel);
+        say(`${cfg.agentLabel} is already installed and managed declaratively.`);
+        say(`  plist:       ${agentPaths(cfg.agentLabel).plist}  (read-only)`);
+        if (owned.program) say(`  runs:        ${owned.program}`);
+        say(`  destination: ${cfg.root ?? "(unset)"}`);
+        say(`  state:       ${s.loaded ? "loaded" : "not loaded"}`);
+        say("");
+        say(owned.byNix
+          ? "Nothing to do. Change it where it is declared, e.g. services.git-backup in home-manager."
+          : "Nothing to do. Another tool owns this plist.");
+        return OK;
+      }
+
       // Installing an agent that sweeps to nowhere is useless, so offer to
       // configure the destination first. Declining is fine - we print the
       // manual commands and stop rather than installing a dead agent.
@@ -280,12 +299,23 @@ async function cmdAgent(sub: string, o: Opts): Promise<number> {
       say("Next: cd <repo> && git backup init     # register a repo with it");
       return OK;
     }
-    case "uninstall":
+    case "uninstall": {
+      if (owned.kind === "managed") {
+        console.error(`${cfg.agentLabel} is managed declaratively; refusing to delete it.`);
+        console.error(
+          owned.byNix
+            ? "  Disable it at the source instead: services.git-backup.enable = false;"
+            : "  Another tool owns this plist; remove it there.",
+        );
+        return ERR;
+      }
       say((await uninstallAgent(cfg.agentLabel)) ? "uninstalled" : "no agent installed");
       return OK;
+    }
     case "status": {
       const s = await agentStatus(cfg.agentLabel);
-      say(`${cfg.agentLabel}: ${s.loaded ? "loaded" : "not loaded"}`);
+      const how = owned.kind === "managed" ? " (managed declaratively)" : "";
+      say(`${cfg.agentLabel}: ${s.loaded ? "loaded" : "not loaded"}${how}`);
       return s.loaded ? OK : NOTHING;
     }
     case "kick":

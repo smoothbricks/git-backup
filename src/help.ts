@@ -536,8 +536,16 @@ subcommands
               ~/Library/Logs/git-backup.log. StartOnMount is what makes plugging
               the backup drive in trigger a sweep. Re-running install rewrites
               and reloads the plist.
+
+              If the plist already exists and is not writable by you, it is
+              owned by something else - typically home-manager or nix-darwin,
+              which install a read-only copy. Install then changes nothing: it
+              reports the label, the binary the job runs, the destination and
+              whether launchd has it loaded, and exits 0.
   uninstall   Unload the job and remove the plist. Registered repos, remotes and
               every ref already pushed are untouched; only the schedule stops.
+              Refuses, without unloading anything, when the plist is managed
+              declaratively; disable it at its source instead.
   status      Whether the plist exists, whether launchd has it loaded, its last
               exit status and the last few log lines.
   kick        Run the job now via 'launchctl kickstart gui/<uid>/<label>'. This
@@ -554,9 +562,10 @@ subcommands
   commands protects you where a TTY check alone would not.
 
   If you install git-backup through the home-manager module, home-manager owns
-  the agent and its label is org.nix-community.home.git-backup. Do not also run
-  'agent install'; instead point the hooks at the right job with
-  'git config --global backup.agentLabel org.nix-community.home.git-backup'.
+  the agent and its label is org.nix-community.home.git-backup. The module also
+  writes that label into backup.agentLabel for you, so the hooks kick the right
+  job. Running 'agent install' anyway is harmless - it detects the managed
+  plist, reports the state and does nothing.
 
 examples
   git backup agent install                  # asks the setup questions if needed
