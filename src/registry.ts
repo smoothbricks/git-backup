@@ -1,5 +1,7 @@
 import { $ } from "bun";
-import { resolve } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { mkdir } from "node:fs/promises";
 import { globalConfigAll } from "./git.ts";
 import { loadConfig } from "./config.ts";
 import { createDest } from "./remote.ts";
@@ -7,25 +9,85 @@ import { destFor, findRepo, type RepoInfo } from "./repo.ts";
 import { installHooks } from "./hooks.ts";
 
 /**
- * The repo registry IS git maintenance's.
+ * Fallback registry.
  *
- * `git maintenance register` appends to the global multi-valued maintenance.repo
- * key; we read the same list. One registration serves both tools, and a repo
- * already registered for maintenance starts being swept as soon as it grows a
- * backup remote.
+ * The primary registry is git maintenance's own `maintenance.repo`, which is a
+ * multi-valued key in the GLOBAL git config. That breaks completely when the
+ * global config is read-only - exactly what home-manager's `programs.git`
+ * produces, since it materialises ~/.config/git/config as a nix store file.
+ * `git maintenance register` then fails, the registry stays permanently empty
+ * and every sweep reports "swept 0 repos" while looking perfectly healthy.
+ *
+ * So registration degrades to a plain file we own. Reads always union both, and
+ * a machine with a writable global config still uses maintenance.repo, keeping
+ * one registration meaningful to both tools.
  */
+export const REGISTRY_FILE = join(
+  process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"),
+  "git-backup",
+  "repos",
+);
+
+async function fileRegistry(): Promise<string[]> {
+  const f = Bun.file(REGISTRY_FILE);
+  if (!(await f.exists())) return [];
+  return (await f.text())
+    .split("\n")
+    .map((l) => l.replace(/#.*$/, "").trim())
+    .filter((l) => l.length > 0);
+}
+
+async function writeFileRegistry(paths: readonly string[]): Promise<void> {
+  await mkdir(dirname(REGISTRY_FILE), { recursive: true });
+  const header = "# Repos swept by git-backup. Managed by 'git backup register'.\n";
+  await Bun.write(REGISTRY_FILE, header + [...paths].sort().join("\n") + "\n");
+}
+
+/** Every registered repo: git maintenance's list unioned with our own. */
 export async function registeredRepos(): Promise<string[]> {
-  return globalConfigAll("maintenance.repo");
+  const merged = new Set([...(await globalConfigAll("maintenance.repo")), ...(await fileRegistry())]);
+  return [...merged].sort();
 }
 
-export async function registerPath(path: string): Promise<boolean> {
-  const res = await $`git -C ${path} maintenance register`.quiet().nothrow();
-  return res.exitCode === 0;
+/** True when `git config --global` can actually be written. */
+export async function globalConfigWritable(): Promise<boolean> {
+  const probe = await $`git config --global --add gitbackup.probe 1`.quiet().nothrow();
+  if (probe.exitCode !== 0) return false;
+  await $`git config --global --unset-all gitbackup.probe`.quiet().nothrow();
+  return true;
 }
 
-export async function unregisterPath(path: string): Promise<boolean> {
-  const res = await $`git -C ${path} maintenance unregister --force`.quiet().nothrow();
-  return res.exitCode === 0;
+export type RegisterResult = { ok: boolean; where: "maintenance" | "file" | "none"; detail: string };
+
+export async function registerPath(path: string): Promise<RegisterResult> {
+  const abs = resolve(path);
+  const viaGit = await $`git -C ${abs} maintenance register`.quiet().nothrow();
+  if (viaGit.exitCode === 0) return { ok: true, where: "maintenance", detail: "" };
+
+  const current = await fileRegistry();
+  if (!current.includes(abs)) await writeFileRegistry([...current, abs]);
+  return {
+    ok: true,
+    where: "file",
+    detail: viaGit.stderr.toString().trim().split("\n")[0] ?? "global git config not writable",
+  };
+}
+
+export async function unregisterPath(path: string): Promise<RegisterResult> {
+  const abs = resolve(path);
+  let removed = false;
+
+  if ((await $`git -C ${abs} maintenance unregister --force`.quiet().nothrow()).exitCode === 0) {
+    removed = true;
+  }
+
+  const current = await fileRegistry();
+  if (current.includes(abs)) {
+    await writeFileRegistry(current.filter((p) => p !== abs));
+    removed = true;
+  }
+
+  return { ok: removed, where: removed ? "file" : "none", detail: "" };
 }
 
 export type InitResult = {
@@ -33,8 +95,9 @@ export type InitResult = {
   destUrl: string;
   created: boolean;
   remoteAdded: boolean;
-  registered: boolean;
+  registered: RegisterResult;
   hooks: string[];
+  excluded: boolean;
 };
 
 export async function initRepo(
@@ -60,7 +123,6 @@ export async function initRepo(
 
   const dest = destFor(root, base, repo.root);
 
-  // Does the destination already exist? ls-remote against a URL needs no remote.
   const probe = await repo.git.run("ls-remote", "--quiet", dest.url);
   let created = false;
   if (!probe.ok) {
@@ -78,10 +140,22 @@ export async function initRepo(
     remoteAdded = true;
   }
 
-  const registered = opts.register === false ? false : await registerPath(repo.root);
-  const hooks = opts.hooks === false ? [] : await installHooks(repo);
+  const registered: RegisterResult =
+    opts.register === false
+      ? { ok: false, where: "none", detail: "skipped" }
+      : await registerPath(repo.root);
 
-  return { repo, destUrl: dest.url, created, remoteAdded, registered, hooks };
+  const installed = opts.hooks === false ? { hooks: [], excluded: false } : await installHooks(repo);
+
+  return {
+    repo,
+    destUrl: dest.url,
+    created,
+    remoteAdded,
+    registered,
+    hooks: installed.hooks,
+    excluded: installed.excluded,
+  };
 }
 
 export type RepoSummary = {
@@ -91,7 +165,6 @@ export type RepoSummary = {
   enabled: boolean;
   destUrl: string | null;
   snapAge: number | null;
-  unpushed: number | null;
   skipReason: string | null;
 };
 
@@ -104,7 +177,6 @@ export async function summarize(path: string): Promise<RepoSummary> {
     enabled: true,
     destUrl: null,
     snapAge: null,
-    unpushed: null,
     skipReason: null,
   };
 
@@ -126,7 +198,6 @@ export async function summarize(path: string): Promise<RepoSummary> {
     enabled: cfg.enabled,
     destUrl,
     snapAge: latest ? Math.floor(Date.now() / 1000) - Number(latest) : null,
-    unpushed: null,
     skipReason: !cfg.enabled ? "disabled" : destUrl === null ? "no backup remote" : null,
   };
 }

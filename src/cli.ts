@@ -10,7 +10,14 @@ import { runRepo, sweep, type RunOutcome } from "./run.ts";
 import { restore } from "./restore.ts";
 import { status } from "./status.ts";
 import { atticSweep, gcAttic, lsRemote, pushAll, reachable } from "./remote.ts";
-import { initRepo, registerPath, registeredRepos, summarize, unregisterPath } from "./registry.ts";
+import {
+  REGISTRY_FILE,
+  initRepo,
+  registerPath,
+  registeredRepos,
+  summarize,
+  unregisterPath,
+} from "./registry.ts";
 import { installHooks, uninstallHooks } from "./hooks.ts";
 import { agentOwnership, agentPaths, agentStatus, installAgent, kickAgent, uninstallAgent } from "./agent.ts";
 import { manualSetupHint, setNoInteractive, setupWizard } from "./interactive.ts";
@@ -51,8 +58,20 @@ async function cmdInit(o: Opts): Promise<number> {
   });
   say(`destination: ${r.destUrl}${r.created ? "  (created)" : "  (already present)"}`);
   say(`remote:      ${r.remoteAdded ? "configured" : "unchanged"}`);
-  say(`registered:  ${r.registered ? "yes" : "no"}`);
+  say(
+    `registered:  ${
+      r.registered.where === "maintenance"
+        ? "yes (git maintenance)"
+        : r.registered.where === "file"
+          ? `yes (${REGISTRY_FILE})`
+          : "no"
+    }`,
+  );
+  if (r.registered.where === "file") {
+    say(`             global git config is read-only: ${r.registered.detail}`);
+  }
   say(`hooks:       ${r.hooks.length > 0 ? r.hooks.join(", ") : "skipped"}`);
+  if (r.excluded) say("             (hooks live in-worktree; added to .git/info/exclude)");
   say("");
   say("Next: git backup run     # snapshot and push now");
   return OK;
@@ -63,9 +82,10 @@ async function cmdRegister(paths: string[], add: boolean): Promise<number> {
   const targets = paths.length > 0 ? paths : [(await requireRepo()).root];
   let failed = 0;
   for (const p of targets) {
-    const ok = add ? await registerPath(p) : await unregisterPath(p);
-    say(`${ok ? (add ? "registered" : "unregistered") : "FAILED"}: ${p}`);
-    if (!ok) failed++;
+    const r = add ? await registerPath(p) : await unregisterPath(p);
+    const how = r.where === "file" ? " (git-backup registry)" : "";
+    say(`${r.ok ? (add ? "registered" : "unregistered") : "FAILED"}${how}: ${p}`);
+    if (!r.ok) failed++;
   }
   return failed > 0 ? ERR : OK;
 }
@@ -139,6 +159,17 @@ async function cmdSweep(o: Opts): Promise<number> {
   const { outcomes, locked } = await sweep({ dryRun: flag(o, "dryRun") });
   if (locked) {
     say("another sweep is already running");
+    return NOTHING;
+  }
+
+  // An empty registry is the one failure that looks exactly like success: the
+  // agent wakes, finds nothing, exits 0 and logs a tidy "swept 0 repo(s)"
+  // forever. Say so, with the remedy, on every run.
+  if (outcomes.length === 0) {
+    console.error("swept 0 repos: nothing is registered, so this agent can never back anything up.");
+    console.error("  Register one:  cd <repo> && git backup init");
+    console.error("  Registries:    git config --global --get-all maintenance.repo");
+    console.error(`                 ${REGISTRY_FILE}`);
     return NOTHING;
   }
 
@@ -337,7 +368,9 @@ async function cmdHooks(sub: string): Promise<number> {
   await preflight();
   const repo = await requireRepo();
   if (sub === "install") {
-    say(`installed: ${(await installHooks(repo)).join(", ")}`);
+    const r = await installHooks(repo);
+    say(`installed: ${r.hooks.join(", ")}`);
+    if (r.excluded) say("hooks live inside the worktree; added to .git/info/exclude");
     return OK;
   }
   if (sub === "uninstall") {
