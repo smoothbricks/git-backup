@@ -17,6 +17,13 @@ export class GitError extends Error {
   }
 }
 
+let verbose = false;
+
+/** Echo every git invocation to stderr. Stderr so parsed stdout stays clean. */
+export function setVerbose(v: boolean): void {
+  verbose = v;
+}
+
 /**
  * Thin wrapper over `git -C <dir>`.
  *
@@ -31,11 +38,13 @@ export class Git {
   ) {}
 
   async run(...args: string[]): Promise<RunResult> {
+    if (verbose) console.error(`+ git -C ${this.dir} ${args.join(" ")}`);
     const res = await $`git -C ${this.dir} ${args}`
       .env({ ...process.env, ...this.extraEnv } as Record<string, string>)
       .quiet()
       .nothrow();
     const code = res.exitCode;
+    if (verbose && code !== 0) console.error(`  -> exit ${code}: ${res.stderr.toString().trim()}`);
     return {
       code,
       stdout: res.stdout.toString(),

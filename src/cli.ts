@@ -3,7 +3,7 @@ import { Command } from "commander";
 import { VERSION, commandHelp, topLevelHelp } from "./help.ts";
 import { preflight } from "./preflight.ts";
 import { humanAge, loadConfig } from "./config.ts";
-import { Git } from "./git.ts";
+import { Git, setVerbose } from "./git.ts";
 import { destFor, findRepo, requireRepo } from "./repo.ts";
 import { snapshot } from "./snapshot.ts";
 import { runRepo, sweep, type RunOutcome } from "./run.ts";
@@ -13,6 +13,7 @@ import { atticSweep, gcAttic, lsRemote, pushAll, reachable } from "./remote.ts";
 import { initRepo, registerPath, registeredRepos, summarize, unregisterPath } from "./registry.ts";
 import { installHooks, uninstallHooks } from "./hooks.ts";
 import { agentPaths, agentStatus, installAgent, kickAgent, uninstallAgent } from "./agent.ts";
+import { manualSetupHint, setNoInteractive, setupWizard } from "./interactive.ts";
 
 const OK = 0;
 const ERR = 1;
@@ -31,6 +32,16 @@ const flag = (o: Opts, name: string) => o[name] === true;
 async function cmdInit(o: Opts): Promise<number> {
   await preflight();
   const repo = await requireRepo();
+
+  // Offer the wizard rather than erroring out, when nothing is configured yet
+  // and a human is watching. --root skips it; so does a non-tty.
+  if (typeof o.root !== "string" && (await loadConfig(repo.git)).root === null) {
+    if ((await setupWizard(repo.git)) === null) {
+      console.error(manualSetupHint());
+      return ERR;
+    }
+  }
+
   const r = await initRepo(repo, {
     root: typeof o.root === "string" ? o.root : undefined,
     remote: typeof o.remote === "string" ? o.remote : undefined,
@@ -239,19 +250,34 @@ async function cmdStatus(): Promise<number> {
   return r.healthy ? OK : NOTHING;
 }
 
-async function cmdAgent(sub: string): Promise<number> {
+async function cmdAgent(sub: string, o: Opts): Promise<number> {
   // Agent commands are global: they must work from outside any repo, so config
   // is read through a cwd-scoped Git, which falls back to global config.
   const repo = await findRepo();
-  const cfg = await loadConfig(repo?.git ?? new Git(process.cwd()));
+  const git = repo?.git ?? new Git(process.cwd());
+  let cfg = await loadConfig(git);
 
   switch (sub) {
     case "install": {
+      // Installing an agent that sweeps to nowhere is useless, so offer to
+      // configure the destination first. Declining is fine - we print the
+      // manual commands and stop rather than installing a dead agent.
+      if (cfg.root === null || flag(o, "reconfigure")) {
+        const done = await setupWizard(git, { reconfigure: flag(o, "reconfigure") });
+        if (done === null) {
+          console.error(manualSetupHint());
+          return ERR;
+        }
+        cfg = await loadConfig(git);
+      }
       const p = await installAgent({ label: cfg.agentLabel, interval: cfg.interval, startOnMount: true });
       say(`installed ${p.label}`);
-      say(`  plist:    ${p.plist}`);
-      say(`  log:      ${p.log}`);
-      say(`  interval: ${cfg.interval}s, plus on-mount and on-commit`);
+      say(`  destination: ${cfg.root}`);
+      say(`  plist:       ${p.plist}`);
+      say(`  log:         ${p.log}`);
+      say(`  interval:    ${cfg.interval}s, plus on-mount and on-commit`);
+      say("");
+      say("Next: cd <repo> && git backup init     # register a repo with it");
       return OK;
     }
     case "uninstall":
@@ -297,8 +323,10 @@ function build(): Command {
   const program = new Command();
   program
     .name("git-backup")
-    .version(VERSION, "-v, --version")
+    .version(VERSION)
+    .option("-v, --verbose", "echo every git command that is run")
     .option("-q, --quiet", "suppress informational output")
+    .option("--no-interactive", "never prompt; fail with instructions instead")
     .exitOverride();
   program.helpInformation = () => topLevelHelp();
 
@@ -357,7 +385,9 @@ function build(): Command {
     .action((b: string, p: string[], o: Opts) => run(() => cmdRestore(b, p, o))());
 
   sub("status").action(run(cmdStatus));
-  sub("agent", "<subcommand>").action((s: string) => run(() => cmdAgent(s))());
+  sub("agent", "<subcommand>")
+    .option("--reconfigure", "re-run the destination setup before installing")
+    .action((s: string, o: Opts) => run(() => cmdAgent(s, o))());
   sub("hooks", "<subcommand>").action((s: string) => run(() => cmdHooks(s))());
 
   sub("help", "[command]").action((c?: string) => {
@@ -376,6 +406,8 @@ async function main(): Promise<void> {
   }
 
   quiet = argv.includes("-q") || argv.includes("--quiet");
+  setVerbose(argv.includes("-v") || argv.includes("--verbose"));
+  setNoInteractive(argv.includes("--no-interactive"));
 
   try {
     await build().parseAsync(Bun.argv);

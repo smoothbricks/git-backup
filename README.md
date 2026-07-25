@@ -110,7 +110,8 @@ its own bun through nvfetcher rather than taking nixpkgs' version; bump it with:
 nix shell nixpkgs#nvfetcher -c nvfetcher -o _sources
 ```
 
-Then install the agent:
+Then install the agent. With no `backup.root` configured yet, this asks you where backups
+should go before installing:
 
 ```bash
 git backup agent install
@@ -125,14 +126,35 @@ let `agent install` write the absolute path it was invoked as. Verify with
 ## Quick start
 
 ```bash
+git backup agent install
+cd ~/Dev/myrepo && git backup init
+```
+
+`agent install` runs a short setup wizard the first time, because `backup.root` is not set
+yet. It asks three questions — the destination root (offering `/Volumes/Backup/Dev` and
+`ssh://nas.local/srv/backup` as examples), the local base directory (default `$HOME/Dev`)
+and the sweep interval in seconds (default `300`) — then shows you the exact
+`git config --global` lines it is about to write and asks you to confirm. Decline and it
+writes nothing, printing the commands so you can run them yourself. Use `--reconfigure` to
+run the wizard again later, once `backup.root` is already set.
+
+If the destination is a local path that does not exist yet, the wizard tells you it will be
+created on first use. If neither it nor its parent is writable it warns you — usually that
+means a removable or network volume is not mounted — and asks for explicit confirmation
+before saving.
+
+To skip the questions, set the destination first and nothing prompts:
+
+```bash
 git config --global backup.root /Volumes/Backup/Dev   # or ssh://host/srv/backup
 git backup agent install
 cd ~/Dev/myrepo && git backup init
 ```
 
-That is the whole setup. `init` creates the destination bare repo, adds the `backup` remote,
-registers the repo, and installs the hooks. It is idempotent — re-run it whenever you change
-configuration.
+Either way, `init` creates the destination bare repo, adds the `backup` remote, registers
+the repo, and installs the hooks. It is idempotent — re-run it whenever you change
+configuration. `init` offers the same wizard when `backup.root` is unset and you did not
+pass `--root`, rather than erroring out; passing `--root` skips it.
 
 Every command has a detailed page, and `git backup help` on its own prints the overview,
 the quick start, the registry explanation and the full configuration table:
@@ -142,6 +164,33 @@ git backup help
 git backup help restore
 git backup help agent
 ```
+
+Five flags work everywhere: `-v, --verbose` echoes every git command that is run to stderr,
+prefixed `+ git `, so it never contaminates stdout for anything being parsed; `-q, --quiet`
+suppresses informational output; `-V, --version` and `-h, --help` do the obvious; and
+`--no-interactive` is covered next.
+
+### Non-interactive use
+
+`--no-interactive` turns every prompt into a failure with the manual commands printed, which
+is what you want in a script, a CI job or a provisioning run:
+
+```bash
+git backup agent install --no-interactive     # exits 1 with instructions if unconfigured
+git config --global backup.root /srv/backup   # ...so configure it up front instead
+git backup init --no-interactive
+```
+
+Prompting is doubly constrained. Only `init` and `agent install` contain any prompt at all,
+and even they require **both** stdin and stdout to be a TTY. `sweep` and `agent kick` — the
+two paths reachable from launchd and from git hooks — have no prompt code reachable from
+them whatsoever, so a scheduled run or a post-commit hook can never hang waiting for input.
+
+That structural guarantee is deliberate, not just belt-and-braces over an `isTTY` check:
+with file descriptor 0 closed outright, `process.stdin.isTTY` reports `true` and a prompt
+would block forever. Confining prompts to specific commands is the protection that actually
+holds. With stdin at `/dev/null`, `init` and `agent install` exit 1 in under 110ms with
+instructions, `agent kick` exits 0, and `sweep` exits 2.
 
 ## Registering repos
 

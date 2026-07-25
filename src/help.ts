@@ -74,26 +74,37 @@ System
   help          Show help for a command
 
 Global flags
-  --verbose     Echo every git command that is run
-  --quiet       Suppress everything but errors
-  --version     Print the version and exit
-  --help        Show this help, or the page for the given command
+  -v, --verbose      Echo every git command that is run, to stderr, prefixed
+                     '+ git ...', so it never contaminates parseable stdout
+  -q, --quiet        Suppress everything but errors
+  -V, --version      Print the version and exit
+  -h, --help         Show this help, or the page for the given command
+  --no-interactive   Never prompt. Fail with the instructions instead, so a
+                     script or a CI job can never hang waiting for input.
 
 QUICK START
 
-  # 1. Say where backups go. Any path git can write to, or an ssh URL.
-  git config --global backup.root /Volumes/Backup/Dev   # or ssh://host/srv/backup
-
-  # 2. Install the launchd agent that sweeps every registered repo.
+  # Answer three questions - destination, local base, sweep interval - then the
+  # agent is installed. This is the whole setup.
   git backup agent install
 
-  # 3. Wire up a repo. Creates the destination, adds the remote, registers,
-  #    installs hooks. Idempotent, so re-running it is always safe.
+  # Wire up a repo. Creates the destination, adds the remote, registers,
+  # installs hooks. Idempotent, so re-running it is always safe.
   cd ~/Dev/myrepo && git backup init
+
+  Prefer to skip the questions? Set the destination first and neither command
+  asks anything:
+
+      git config --global backup.root /Volumes/Backup/Dev   # or ssh://host/srv/bk
+      git backup agent install
+      cd ~/Dev/myrepo && git backup init
 
   After that there is nothing to do by hand. The agent sweeps on its interval and
   on volume mount, and the hooks kick it immediately after a commit, rebase,
   checkout or merge.
+
+  'sweep' and 'agent kick' never prompt under any circumstances, so a scheduled
+  run or a git hook cannot hang.
 
 REGISTERING MORE REPOS
 
@@ -152,6 +163,13 @@ usage: git backup init [--root <url>] [--remote <name>] [--base <dir>]
 Prepares the current repository for backup. Every step is idempotent, so re-run
 it freely after changing configuration or moving the destination.
 
+If backup.root is not configured and no --root was given, init offers to set it
+up interactively rather than failing: it asks for the destination root, the local
+base directory and the sweep interval, shows you the exact 'git config --global'
+lines it is about to write, and only writes them once you agree. Passing --root
+skips the wizard entirely, as does --no-interactive, which fails with the manual
+commands instead of asking.
+
   1. Works out the destination: the repo's path relative to backup.base, hung
      off backup.root, with a .git suffix. A repo outside backup.base maps to its
      absolute path with the leading slash stripped, so the mapping stays
@@ -168,6 +186,7 @@ it freely after changing configuration or moving the destination.
 flags
   --root <url>     Destination root for this repo. Also written to the repo's
                    local backup.root. Defaults to the configured backup.root.
+                   Supplying it skips the interactive setup.
   --remote <name>  Remote name to create. Default: backup
   --base <dir>     Local prefix stripped to compute the relative destination
                    path. Default: backup.base, else $HOME/Dev
@@ -177,7 +196,8 @@ flags
                    destination and a remote but is not swept automatically.
 
 examples
-  git config --global backup.root /Volumes/Backup/Dev
+  git backup init                    # asks for a destination if none is set yet
+  git config --global backup.root /Volumes/Backup/Dev    # ...or set it up front
   cd ~/Dev/myrepo && git backup init
   # ~/Dev/myrepo         ->  /Volumes/Backup/Dev/myrepo.git
   # ~/Dev/work/api       ->  /Volumes/Backup/Dev/work/api.git
@@ -483,21 +503,39 @@ examples
 
   agent: `git backup agent - manage the launchd agent that runs sweeps
 
-usage: git backup agent install
+usage: git backup agent install [--reconfigure]
        git backup agent uninstall
        git backup agent status
        git backup agent kick
        git backup agent log
 
 subcommands
-  install     Write ~/Library/LaunchAgents/<label>.plist and load it. The label
-              is backup.agentLabel (default dev.gitbackup.sweep), overridable
-              with GIT_BACKUP_LABEL. The job runs 'git-backup sweep' with
-              StartInterval backup.interval (default 300), StartOnMount true,
-              ThrottleInterval 60, ProcessType Background, LowPriorityIO true
-              and RunAtLoad false. Output goes to ~/Library/Logs/git-backup.log.
-              StartOnMount is what makes plugging the backup drive in trigger a
-              sweep. Re-running install rewrites and reloads the plist.
+  install     Write ~/Library/LaunchAgents/<label>.plist and load it.
+
+              When backup.root is not set, install first runs a short setup
+              wizard. It asks for the destination root (offering
+              /Volumes/Backup/Dev and ssh://nas.local/srv/backup as examples),
+              the local base directory (default $HOME/Dev) and the sweep
+              interval in seconds (default 300). It then prints the exact
+              'git config --global' lines it will write and asks you to
+              confirm. Decline and it writes nothing, printing the commands so
+              you can run them yourself. Pass --reconfigure to run the wizard
+              again even when backup.root is already set.
+
+              If the destination is a local path that does not exist yet, the
+              wizard says it will be created on first use. If neither it nor its
+              parent is writable, it warns you - usually this means a removable
+              or network volume is not mounted - and asks for explicit
+              confirmation before saving.
+
+              The label is backup.agentLabel (default dev.gitbackup.sweep),
+              overridable with GIT_BACKUP_LABEL. The job runs 'git-backup sweep'
+              with StartInterval backup.interval (default 300), StartOnMount
+              true, ThrottleInterval 60, ProcessType Background, LowPriorityIO
+              true and RunAtLoad false. Output goes to
+              ~/Library/Logs/git-backup.log. StartOnMount is what makes plugging
+              the backup drive in trigger a sweep. Re-running install rewrites
+              and reloads the plist.
   uninstall   Unload the job and remove the plist. Registered repos, remotes and
               every ref already pushed are untouched; only the schedule stops.
   status      Whether the plist exists, whether launchd has it loaded, its last
@@ -505,8 +543,15 @@ subcommands
   kick        Run the job now via 'launchctl kickstart gui/<uid>/<label>'. This
               is exactly what the installed git hooks call, which is why a
               commit produces a backup within seconds instead of on the next
-              interval.
+              interval. Never prompts, and exits 0 even with no agent installed,
+              so a hook can never block your commit.
   log         Tail ~/Library/Logs/git-backup.log.
+
+  Only 'install' and 'init' ever prompt, and only when both stdin and stdout are
+  a terminal. 'sweep' and 'agent kick' contain no reachable prompt at all, which
+  is the real guarantee: with fd 0 closed outright, process.stdin.isTTY reports
+  true and a prompt would block forever, so confining prompts to specific
+  commands protects you where a TTY check alone would not.
 
   If you install git-backup through the home-manager module, home-manager owns
   the agent and its label is org.nix-community.home.git-backup. Do not also run
@@ -514,7 +559,9 @@ subcommands
   'git config --global backup.agentLabel org.nix-community.home.git-backup'.
 
 examples
-  git backup agent install
+  git backup agent install                  # asks the setup questions if needed
+  git backup agent install --reconfigure    # change the answers later
+  git backup agent install --no-interactive # fail instead of asking
   git backup agent status
   git backup agent kick
   git backup agent log
