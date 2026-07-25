@@ -53,6 +53,30 @@ export class Git {
     };
   }
 
+  /**
+   * Run with stderr inherited so git's own progress reaches the terminal.
+   *
+   * `run` captures both streams, which silently swallows the counting /
+   * compressing / writing counters - painful on a first push, or any push over
+   * a network filesystem. stdout stays piped because callers parse it
+   * (`--porcelain`). Only worth using for genuinely slow commands.
+   *
+   * stderr is consumed by the terminal rather than captured, so `stderr` comes
+   * back empty; the user has already seen it.
+   */
+  async stream(...args: string[]): Promise<RunResult> {
+    if (verbose) console.error(`+ git -C ${this.dir} ${args.join(" ")}`);
+    const proc = Bun.spawn(["git", "-C", this.dir, ...args], {
+      env: { ...process.env, ...this.extraEnv },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "inherit",
+    });
+    const stdout = await new Response(proc.stdout).text();
+    const code = await proc.exited;
+    return { code, stdout, stderr: "", ok: code === 0 };
+  }
+
   /** Run and throw on failure. Returns trimmed stdout. */
   async out(...args: string[]): Promise<string> {
     const r = await this.run(...args);

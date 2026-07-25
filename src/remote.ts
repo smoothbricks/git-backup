@@ -105,13 +105,22 @@ export async function pushAll(
     "+refs/backup/*:refs/backup/*",
   );
 
-  const res = await repo.git.run(...args);
+  // Stream git's progress straight to the terminal when a human is watching.
+  // Under launchd or in a pipe stderr is captured instead: progress counters are
+  // carriage-return spam that would otherwise fill the log with unreadable
+  // partial lines, and a captured stderr is what error reporting needs anyway.
+  const interactive = process.stderr.isTTY === true;
+  const res = interactive ? await repo.git.stream(...args) : await repo.git.run(...args);
+
   const updated = res.stdout
     .split("\n")
     .filter((l) => /^[*+\-=!]\t/.test(l) && !l.startsWith("=\t"))
     .map((l) => l.split("\t")[1] ?? l);
 
-  return { ok: res.ok, updated, error: res.ok ? "" : res.stderr.trim() };
+  // With stderr inherited the user already saw git's own message, so there is
+  // nothing to quote back at them - just say which command failed.
+  const error = res.ok ? "" : res.stderr.trim() || `git push exited ${res.code}`;
+  return { ok: res.ok, updated, error };
 }
 
 /** How many commits exist locally on branches that the destination has not got. */
