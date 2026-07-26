@@ -130,11 +130,19 @@ async function cmdSnapDryRun(o: Opts): Promise<number> {
     say(r.kind === "clean" ? "worktree clean - nothing to snapshot" : "no change since last snapshot");
     return NOTHING;
   }
+  const CAP = 40;
   say(`would include ${r.included.length} untracked file(s):`);
-  for (const f of r.included) say(`  + ${f}`);
+  for (const f of r.included.slice(0, CAP)) say(`  + ${f}`);
+  if (r.included.length > CAP) say(`  ... and ${r.included.length - CAP} more`);
   if (r.skipped.length > 0) {
+    // A build directory yields tens of thousands of exclusions; listing them
+    // all is unreadable and, before this, also blew ARG_MAX downstream.
     say(`would skip ${r.skipped.length}:`);
-    for (const s of r.skipped) say(`  - ${s.path}  (${s.reason})`);
+    for (const s of r.skipped.slice(0, CAP)) say(`  - ${s.path}  (${s.reason})`);
+    if (r.skipped.length > CAP) {
+      say(`  ... and ${r.skipped.length - CAP} more`);
+      say("  (full breakdown by reason and directory lands in the snapshot commit message)");
+    }
   }
   return OK;
 }

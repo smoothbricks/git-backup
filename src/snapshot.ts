@@ -13,8 +13,58 @@ export type SnapResult =
   | { kind: "unchanged"; tree: string }
   | { kind: "created"; commit: string; tree: string; included: string[]; skipped: Skip[] };
 
-const ADD_CHUNK = 400;
+/**
+ * Per-exec argv budget. macOS ARG_MAX is 1 MiB and the environment counts
+ * against it, so stay well clear.
+ */
+const ARG_BUDGET = 96 * 1024;
 const SNIFF_BYTES = 8192;
+const SKIP_EXAMPLES = 12;
+
+function* byArgBudget(paths: readonly string[]): Generator<string[]> {
+  let batch: string[] = [];
+  let bytes = 0;
+  for (const p of paths) {
+    const cost = Buffer.byteLength(p) + 1;
+    if (batch.length > 0 && bytes + cost > ARG_BUDGET) {
+      yield batch;
+      batch = [];
+      bytes = 0;
+    }
+    batch.push(p);
+    bytes += cost;
+  }
+  if (batch.length > 0) yield batch;
+}
+
+/**
+ * Exclusions must stay visible - a backup that silently under-covers is worse
+ * than no backup - but one build directory yields tens of thousands of them.
+ * Aggregate by reason and by top-level directory, then show a few examples.
+ * That is both bounded and more useful than an unreadable wall of paths.
+ */
+function summariseSkips(skipped: readonly Skip[]): string[] {
+  if (skipped.length === 0) return [];
+
+  const byReason = new Map<string, number>();
+  const byDir = new Map<string, number>();
+  for (const s of skipped) {
+    // Size reasons are per-file ("4.2M"); collapse them into one bucket.
+    const reason = /^\d/.test(s.reason) ? "too large" : s.reason;
+    byReason.set(reason, (byReason.get(reason) ?? 0) + 1);
+    const slash = s.path.indexOf("/");
+    const dir = slash === -1 ? "(root)" : `${s.path.slice(0, slash)}/`;
+    byDir.set(dir, (byDir.get(dir) ?? 0) + 1);
+  }
+
+  const rank = (m: Map<string, number>, n: number) =>
+    [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, n).map(([k, v]) => `${k} ${v}`).join(", ");
+
+  const out = ["", `skipped by reason: ${rank(byReason, 6)}`, `top directories:   ${rank(byDir, 6)}`, ""];
+  for (const s of skipped.slice(0, SKIP_EXAMPLES)) out.push(`  ${s.path} (${s.reason})`);
+  if (skipped.length > SKIP_EXAMPLES) out.push(`  ... and ${skipped.length - SKIP_EXAMPLES} more`);
+  return out;
+}
 
 async function readIncludeFile(repo: RepoInfo, rel: string): Promise<string[]> {
   const f = Bun.file(join(repo.worktree, rel));
@@ -118,8 +168,10 @@ export async function snapshot(
     const candidates = await staged.nul("ls-files", "--others", "--exclude-standard", "-z");
     const { keep, skipped } = await gate(repo, cfg, candidates, opts.allFiles ?? false);
 
-    for (let i = 0; i < keep.length; i += ADD_CHUNK) {
-      await staged.run("add", "--", ...keep.slice(i, i + ADD_CHUNK));
+    // Chunk by BYTES, not by count. A Rust target/ tree has paths hundreds of
+    // characters long, so a fixed count of 400 can still exceed ARG_MAX.
+    for (const chunk of byArgBudget(keep)) {
+      await staged.run("add", "--", ...chunk);
     }
 
     const tree = await staged.out("write-tree");
@@ -135,24 +187,24 @@ export async function snapshot(
 
     const branch = (await repo.git.tryOut("branch", "--show-current")) || "detached";
     const when = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-    const lines = [
+    const message = [
       `wip ${when} on ${branch}`,
       "",
       `${keep.length} untracked file${keep.length === 1 ? "" : "s"} included, ${skipped.length} skipped`,
-    ];
-    if (skipped.length > 0) {
-      // Every exclusion is reported. A backup that silently under-covers is
-      // worse than no backup, so the omissions live in the commit message.
-      lines.push("");
-      for (const s of skipped) lines.push(`skipped: ${s.path} (${s.reason})`);
-    }
+      ...summariseSkips(skipped),
+    ].join("\n");
 
-    const args = ["commit-tree", tree, "-m", lines.join("\n")];
+    // Message goes in on STDIN. commit-tree reads it from there when no -m is
+    // given, which is the only way it cannot blow ARG_MAX - a build directory
+    // yields tens of thousands of exclusions and -m made the argv megabytes.
+    const args = ["commit-tree", tree];
     if (head) args.push("-p", head);
+    const made = await repo.git.runInput(message, ...args);
+    if (!made.ok) throw new Error(`commit-tree failed: ${made.stderr.trim()}`);
 
     return {
       kind: "created",
-      commit: await repo.git.out(...args),
+      commit: made.stdout.trim(),
       tree,
       included: keep,
       skipped,

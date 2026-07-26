@@ -77,6 +77,30 @@ export class Git {
     return { code, stdout, stderr: "", ok: code === 0 };
   }
 
+  /**
+   * Run with `input` on stdin, both streams captured.
+   *
+   * For payloads that must not go through argv. `git commit-tree` reads its
+   * message from stdin when no -m is given, which is the only safe way to pass
+   * one: a repo with a large build directory produces tens of thousands of
+   * skip lines and `-m` blew ARG_MAX with "Argument list too long".
+   */
+  async runInput(input: string, ...args: string[]): Promise<RunResult> {
+    if (verbose) console.error(`+ git -C ${this.dir} ${args.join(" ")}  <<${input.length}B`);
+    const proc = Bun.spawn(["git", "-C", this.dir, ...args], {
+      env: { ...process.env, ...this.extraEnv },
+      stdin: new Blob([input]),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    const code = await proc.exited;
+    return { code, stdout, stderr, ok: code === 0 };
+  }
+
   /** Run and throw on failure. Returns trimmed stdout. */
   async out(...args: string[]): Promise<string> {
     const r = await this.run(...args);
